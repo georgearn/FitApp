@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Flet
+.flet/
+build/
+
+# Claude Code
+.claude/
+
+# Secrets / local config
+.env
+.env.*
+*api_key*
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
