@@ -1,14 +1,11 @@
 """
-FitApp (no-AI backup) — mini Freeletics-style workout app (Flet).
-
-This is a stripped copy of fitapp/ with the Gemini "Generate with AI" feature
-removed entirely — no network calls, no API key, no ai_workout.py. Everything
-else (body map, search, exercise library, rule-based Generate) is identical.
+FitApp — mini Freeletics-style workout app (Flet).
 
   1. Browse an exercise library, grouped by muscle group, filter by equipment.
-  2. Each exercise: 2-frame looping animation + step-by-step description.
+  2. Each exercise: animated WebP + step-by-step description.
   3. GENERATE 2-3 workout variations from your criteria (target muscles /
-     available equipment / preset), then save the ones you like.
+     available equipment / preset), or via Gemini (ai_workout.py), then save
+     the ones you like.
 
 Library: data/exercises.json, built by tools/build_library.py from the
 WorkoutX library staged in assets/img/ (workoutx_library.json +
