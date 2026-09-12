@@ -100,6 +100,91 @@ def build_prompt(goal, catalog):
     )
 
 
+def build_prompt_local(goal, catalog):
+    """Same idea as build_prompt() but shaped for Gemini Nano's on-device
+    output cap, which is hard-limited to 256 tokens by the platform (raising
+    it throws "max_output_tokens must be between 1 and 256" — it's not
+    configurable). A 4-8 exercise workout with per-exercise "sets"/"reps"/
+    "rest_sec" objects routinely blew past 256 tokens and got cut off
+    mid-JSON.
+
+    The fix isn't fewer exercises, it's a cheaper shape: ask for a flat list
+    of ids only (no nested objects, no repeated key names) and apply sets/
+    reps/rest_sec defaults in code afterwards via parse_workout_local(). An
+    id list costs roughly a third the tokens of the same count of
+    {"id":...,"sets":...,"reps":...} objects, so this comfortably fits 6-8
+    exercises where the old shape struggled to fit 4."""
+    return (
+        "You are a fitness coach building ONE workout for a user.\n"
+        "Choose exercises ONLY from the CATALOG below — use their exact \"id\" values. "
+        "Do not invent exercises or ids.\n"
+        "Respect the user's goal: equipment they have, muscles/areas they want, "
+        "duration, and intensity. Pick 6-8 exercises, ordered sensibly.\n\n"
+        "Return ONLY compact JSON, no prose, no whitespace, this exact shape:\n"
+        '{"name":"short title","ids":["<catalog id>","<catalog id>"]}\n'
+        "Keep the name under 4 words. Do not add sets, reps, or any other fields — "
+        "ids only.\n\n"
+        f"USER GOAL: {goal}\n\n"
+        f"CATALOG (JSON): {json.dumps(catalog)}"
+    )
+
+
+def parse_workout_local(text, valid_ids):
+    """Parse the id-list shape from build_prompt_local() into the same
+    {name, note, exercises:[{id,sets,reps,rest_sec}]} shape parse_workout()
+    produces, filling in default sets/reps/rest_sec since the model wasn't
+    asked for them.
+
+    Deliberately regex-based rather than json.loads(): if Gemini Nano still
+    hits its 256-token cap mid-list, the response cuts off mid-string (e.g.
+    "...", "dumbbell_lu) with no closing bracket at all — there is no
+    complete trailing "}" for a brace-counting repair to rewind to, unlike
+    parse_workout()'s per-exercise objects. Pulling every *complete* quoted
+    id out with a regex just silently drops the one partial id at the cut
+    point instead of failing the whole parse."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t[:4].lower() == "json":
+            t = t[4:]
+    name = "AI Workout"
+    m = re.search(r'"name"\s*:\s*"([^"]*)"', t)
+    if m and m.group(1).strip():
+        name = m.group(1).strip()
+    ids = []
+    m2 = re.search(r'"ids"\s*:\s*\[(.*)', t, re.S)
+    if m2:
+        ids = re.findall(r'"([^"]+)"', m2.group(1))
+    picks = []
+    seen = set()
+    for eid in ids:
+        if eid in valid_ids and eid not in seen:
+            seen.add(eid)
+            picks.append({"id": eid, "sets": 3, "reps": "8-12", "rest_sec": 60})
+    if not picks:
+        raise ValueError("Model returned no usable exercises.")
+    return {"name": name, "note": "", "exercises": picks}
+
+
+def _repair_truncated_json(t):
+    """Best-effort recovery for JSON cut off mid-object — the common failure
+    mode for small on-device models that hit their output-token cap partway
+    through the exercises array (e.g. "Expecting \',\' delimiter" errors).
+    Trims back to the last complete "}" before the cut and re-closes any
+    still-open arrays/objects, so a truncated-but-partial workout still
+    parses instead of failing outright."""
+    last_brace = t.rfind("}")
+    if last_brace == -1:
+        return None
+    candidate = t[:last_brace + 1]
+    candidate += "]" * max(candidate.count("[") - candidate.count("]"), 0)
+    candidate += "}" * max(candidate.count("{") - candidate.count("}"), 0)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
 def parse_workout(text, valid_ids):
     """Parse model text -> {name, note, exercises:[{id,sets,reps,rest_sec}]},
     dropping any id not in valid_ids. Raises ValueError if nothing usable."""
@@ -112,7 +197,12 @@ def parse_workout(text, valid_ids):
     i, j = t.find("{"), t.rfind("}")
     if i != -1 and j != -1:
         t = t[i:j + 1]
-    data = json.loads(t)
+    try:
+        data = json.loads(t)
+    except json.JSONDecodeError:
+        data = _repair_truncated_json(t)
+        if data is None:
+            raise
     picks = []
     seen = set()
     for it in data.get("exercises", []):
@@ -179,3 +269,29 @@ def generate(goal, exercises, api_key, model=DEFAULT_MODEL, timeout=45, retries=
     except (KeyError, IndexError):
         raise RuntimeError("Unexpected Gemini response (blocked or empty).")
     return parse_workout(text, {e["id"] for e in pool})
+
+
+# Gemini Nano (on-device, via AICore) caps input at ~4000 tokens total, so the
+# catalog handed to it must be much smaller than the cloud path's 150.
+MAX_CATALOG_LOCAL = 50
+
+
+async def generate_local(goal, exercises, aicore):
+    """
+    Same pipeline as generate() but runs fully on-device through the AiCore
+    Service control (flet_aicore) — no network, no API key. `aicore` is a
+    flet_aicore.AiCore instance already added to page.services.
+    Raises flet_aicore.AiCoreUnavailableError if Gemini Nano isn't AVAILABLE
+    on this device (non-Pixel, or model not downloaded yet — call
+    aicore.check_status()/aicore.download() first from the UI).
+    """
+    pool = select_relevant(goal, exercises, limit=MAX_CATALOG_LOCAL)
+    catalog = catalog_for(pool)
+    # AICore/Gemini Nano hard-caps max_output_tokens at 256 (raising it
+    # throws "max_output_tokens must be between 1 and 256") — so the fix
+    # isn't a bigger budget, it's a smaller ask: build_prompt_local() below
+    # requests fewer exercises and drops "note"/"rest_sec" so the JSON
+    # reliably fits. _repair_truncated_json() in parse_workout() is a second
+    # line of defense if a response still gets cut off.
+    text = await aicore.generate(build_prompt_local(goal, catalog), max_output_tokens=256)
+    return parse_workout_local(text, {e["id"] for e in pool})

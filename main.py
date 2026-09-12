@@ -1,11 +1,14 @@
 """
-FitApp — mini Freeletics-style workout app (Flet).
+FitApp (no-AI backup) — mini Freeletics-style workout app (Flet).
+
+This is a stripped copy of fitapp/ with the Gemini "Generate with AI" feature
+removed entirely — no network calls, no API key, no ai_workout.py. Everything
+else (body map, search, exercise library, rule-based Generate) is identical.
 
   1. Browse an exercise library, grouped by muscle group, filter by equipment.
-  2. Each exercise: animated WebP + step-by-step description.
+  2. Each exercise: 2-frame looping animation + step-by-step description.
   3. GENERATE 2-3 workout variations from your criteria (target muscles /
-     available equipment / preset), or via Gemini (ai_workout.py), then save
-     the ones you like.
+     available equipment / preset), then save the ones you like.
 
 Library: data/exercises.json, built by tools/build_library.py from the
 WorkoutX library staged in assets/img/ (workoutx_library.json +
@@ -32,6 +35,14 @@ from generator import generate_variations
 from ui_helpers import no_image_placeholder, thumb
 
 import ai_workout
+try:
+    from flet_aicore import AiCore, AiCoreStatus, AiCoreUnavailableError
+    HAS_AICORE = True
+except ImportError:
+    # flet_aicore not built into this run yet (desktop dev, or apk built
+    # before `pip install ./flet_aicore` + a fresh `flet build apk`).
+    # Local/on-device AI toggle is simply hidden until it is.
+    HAS_AICORE = False
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +76,11 @@ def main(page: ft.Page):
     page.bgcolor = BG_APP
     page.padding = 0
     state = {"equipment": "All"}
+
+    aicore = None
+    if HAS_AICORE:
+        aicore = AiCore()
+        page.services.append(aicore)
 
     def is_dark_now():
         b = page.platform_brightness
@@ -512,10 +528,19 @@ def main(page: ft.Page):
 
     async def refresh_workouts():
         wks = await load_workouts(page)
-        workouts_view.controls = ([workout_card(w, i) for i, w in enumerate(wks)]
-                                  or [ft.Text("No workouts yet. Go to Generate.",
+        state["workouts"] = wks
+        workouts_view.controls = ([workout_card_compact(w, i) for i, w in enumerate(wks)]
+                                  or [ft.Text("No workouts yet. Tap “Build Workout” below "
+                                              "or save one from Generate.",
                                               color=ft.Colors.ON_SURFACE_VARIANT)])
         page.update()
+
+    workouts_header = ft.Container(
+        ft.FilledButton("Build Workout", icon=ft.Icons.ADD,
+                        on_click=lambda _: push_manual_view(), expand=True),
+        padding=ft.Padding.symmetric(horizontal=10, vertical=10))
+
+    workouts_tab = ft.Column([workouts_header, workouts_view], expand=True)
 
     async def delete_workout(idx):
         wks = await load_workouts(page)
@@ -524,70 +549,6 @@ def main(page: ft.Page):
             await save_workouts(page, wks)
             await refresh_workouts()
 
-    async def update_workout(idx, name, ids):
-        wks = await load_workouts(page)
-        if 0 <= idx < len(wks):
-            wks[idx]["name"] = name
-            wks[idx]["exercises"] = ids
-            await save_workouts(page, wks)
-            await refresh_workouts()
-
-    def open_edit_workout(idx, w):
-        edit_ids = list(w["exercises"])
-        name_field = ft.TextField(label="Workout name", value=w["name"], autofocus=True)
-        list_box = ft.ListView(spacing=6, height=320)
-
-        def remove_id(eid):
-            if eid in edit_ids:
-                edit_ids.remove(eid)
-            rebuild()
-
-        def rebuild():
-            items = [ex_by_id(i) for i in edit_ids]
-            items = [e for e in items if e]
-            list_box.controls = [
-                ft.Row([thumb(e),
-                        ft.Column([ft.Text(e["name"], size=13, weight=ft.FontWeight.W_500),
-                                   ft.Text(e["muscle"], size=11, color=ft.Colors.ON_SURFACE_VARIANT)],
-                                  spacing=0, expand=True),
-                        ft.IconButton(ft.Icons.CLOSE, icon_size=18,
-                                      on_click=lambda _, x=e["id"]: remove_id(x))],
-                       vertical_alignment=ft.CrossAxisAlignment.CENTER)
-                for e in items
-            ] or [ft.Text("No exercises. Tap “+ Add exercises”.", size=12,
-                          color=ft.Colors.ON_SURFACE_VARIANT)]
-            page.update()
-
-        def apply_add(ids):
-            edit_ids[:] = ids
-            rebuild()
-
-        def open_add(_):
-            open_exercise_picker(edit_ids, apply_add, title="Add exercises")
-
-        def cancel(_):
-            page.pop_dialog()
-
-        def confirm(_):
-            page.pop_dialog()
-            name = name_field.value.strip() or w["name"]
-            page.run_task(update_workout, idx, name, edit_ids)
-
-        rebuild()
-        dlg = ft.AlertDialog(
-            title=ft.Text("Edit workout"),
-            scrollable=True,
-            content=ft.Container(
-                ft.Column([
-                    name_field,
-                    ft.Row([ft.Text("Exercises", weight=ft.FontWeight.BOLD, expand=True),
-                           ft.TextButton("+ Add exercises", on_click=open_add)]),
-                    list_box,
-                ], spacing=8, tight=True),
-                width=360, height=460),
-            actions=[ft.TextButton("Cancel", on_click=cancel),
-                     ft.FilledButton("Save", on_click=confirm)])
-        page.show_dialog(dlg)
 
     def format_saved_at(iso):
         if not iso:
@@ -597,7 +558,7 @@ def main(page: ft.Page):
         except ValueError:
             return None
 
-    def workout_card(w, idx):
+    def workout_exercise_rows(w):
         rows = []
         for x in w["exercises"]:
             e = ex_by_id(x)
@@ -611,21 +572,109 @@ def main(page: ft.Page):
                                 ft.IconButton(ft.Icons.INFO_OUTLINE, icon_size=18,
                                               on_click=lambda _, x=e: open_detail(x))],
                                vertical_alignment=ft.CrossAxisAlignment.CENTER))
+        return rows
+
+    def workout_muscle_summary(w):
+        muscles = []
+        for x in w["exercises"]:
+            e = ex_by_id(x)
+            if e and e["muscle"] not in muscles:
+                muscles.append(e["muscle"])
+        return " · ".join(muscles)
+
+    def workout_card_compact(w, idx):
+        n = len(w["exercises"])
+        meta_line = f"{n} exercise{'' if n == 1 else 's'}"
+        summary = workout_muscle_summary(w)
+        if summary:
+            meta_line += f"  ·  {summary}"
+        return ft.Container(
+            ft.Row([
+                ft.Column([
+                    ft.Text(w["name"], weight=ft.FontWeight.BOLD, size=16),
+                    ft.Text(meta_line, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                ], spacing=2, expand=True),
+                ft.IconButton(ft.Icons.EDIT_OUTLINED, tooltip="Edit in builder",
+                              on_click=lambda _, i=idx: edit_saved_workout(i)),
+                ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=ft.Colors.ERROR,
+                              on_click=lambda _, i=idx: page.run_task(delete_workout, i)),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT, size=18, color=ft.Colors.ON_SURFACE_VARIANT),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            on_click=lambda _, i=idx: open_saved_detail(i),
+            ink=True, padding=12, border_radius=10, bgcolor=ft.Colors.with_opacity(0.10, ft.Colors.PRIMARY),
+            border=ft.Border.all(1, ft.Colors.with_opacity(0.35, ft.Colors.PRIMARY)))
+
+    # ---------- SAVED WORKOUT DETAIL (compact card opens full screen) ----------
+    saved_detail_title = ft.Text("", weight=ft.FontWeight.BOLD, size=18, expand=True)
+    saved_detail_meta = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+    saved_detail_rows_box = ft.Column(spacing=8)
+
+    def pop_saved_detail(_=None):
+        page.go("/")
+
+    def render_saved_detail():
+        wks = state.get("workouts", [])
+        idx = state.get("saved_idx")
+        if idx is None or idx >= len(wks):
+            saved_detail_title.value = "Workout"
+            saved_detail_meta.value = ""
+            saved_detail_rows_box.controls = [ft.Text("Workout not found.",
+                                              color=ft.Colors.ON_SURFACE_VARIANT)]
+            return
+        w = wks[idx]
         saved_at = format_saved_at(w.get("created_at"))
-        meta_line = f"{len(w['exercises'])} exercises"
+        n = len(w["exercises"])
+        meta_line = f"{n} exercise{'' if n == 1 else 's'}"
         if saved_at:
             meta_line += f"  ·  Saved {saved_at}"
-        return ft.Container(
-            ft.Column([
-                ft.Row([ft.Text(w["name"], weight=ft.FontWeight.BOLD, size=16, expand=True),
-                        ft.IconButton(ft.Icons.EDIT_OUTLINED,
-                                      on_click=lambda _, i=idx, x=w: open_edit_workout(i, x)),
-                        ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=ft.Colors.ERROR,
-                                      on_click=lambda _, i=idx: page.run_task(delete_workout, i))]),
-                ft.Text(meta_line, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                *rows], spacing=6),
-            padding=12, border_radius=10, bgcolor=ft.Colors.with_opacity(0.10, ft.Colors.PRIMARY),
-            border=ft.Border.all(1, ft.Colors.with_opacity(0.35, ft.Colors.PRIMARY)))
+        saved_detail_title.value = w["name"]
+        saved_detail_meta.value = meta_line
+        saved_detail_rows_box.controls = workout_exercise_rows(w) or [
+            ft.Text("No exercises in this workout.", color=ft.Colors.ON_SURFACE_VARIANT)]
+
+    def open_saved_detail(idx):
+        state["saved_idx"] = idx
+        render_saved_detail()
+        page.go("/saved")
+
+    def load_saved_into_manual(_):
+        idx = state.get("saved_idx")
+        wks = state.get("workouts", [])
+        if idx is not None and idx < len(wks):
+            manual_picks[:] = list(wks[idx]["exercises"])
+            rebuild_manual_muscle_chips()
+            rebuild_manual_equip_chips()
+            render_manual_results()
+            render_manual_current()
+        page.go("/manual")
+
+    def edit_saved_workout(idx):
+        # Same destination as "Load Into Builder" on the saved-detail screen —
+        # the old standalone edit dialog (name field + its own add-exercise
+        # picker) is gone; editing a saved workout now always means pulling
+        # it into the manual builder.
+        state["saved_idx"] = idx
+        load_saved_into_manual(None)
+
+    def delete_saved_from_detail(_):
+        idx = state.get("saved_idx")
+        page.go("/")
+        if idx is not None:
+            page.run_task(delete_workout, idx)
+
+    saved_detail_view = ft.Column(
+        [ft.Container(ft.Row([ft.IconButton(ft.Icons.ARROW_BACK, on_click=pop_saved_detail),
+                              saved_detail_title]),
+                      padding=ft.Padding.only(left=2, right=12, top=6)),
+         ft.Container(saved_detail_meta, padding=ft.Padding.only(left=16, bottom=6)),
+         ft.Container(saved_detail_rows_box, padding=ft.Padding.symmetric(horizontal=12), expand=True),
+         ft.Container(ft.Row([
+             ft.OutlinedButton("Load Into Builder", icon=ft.Icons.EDIT_NOTE,
+                               on_click=load_saved_into_manual, expand=True),
+             ft.TextButton("Delete", icon=ft.Icons.DELETE_OUTLINE,
+                          on_click=delete_saved_from_detail)]),
+                     padding=ft.Padding.only(left=10, right=10, top=6, bottom=16))],
+        expand=True)
 
     # ---------- GENERATE TAB ----------
     # Flow: 1) how many variations, 2) which muscle groups, 3) per group: how
@@ -749,6 +798,7 @@ def main(page: ft.Page):
             page.pop_dialog()
             label = name_field.value.strip() or default_label
             page.run_task(save_variation, picks, label)
+            page.go("/")
 
         dlg = ft.AlertDialog(
             title=ft.Text("Save workout"),
@@ -826,38 +876,144 @@ def main(page: ft.Page):
         ft.Container(results, padding=ft.Padding.symmetric(horizontal=10)),
     ], expand=True, scroll=ft.ScrollMode.AUTO)
 
-    # ---------- manual generator: hand-pick exercises into a workout ----------
+    # ---------- manual builder: hand-pick exercises, search-style ----------
     manual_picks = []
-    manual_list_box = ft.Column(spacing=8)
+    manual_filt = {"q": "", "muscles": set(), "equipment": set()}
 
-    def manual_row(e):
+    manual_muscle_chips_box = ft.Row(wrap=True, spacing=6, run_spacing=6)
+    manual_equip_chips_box = ft.Row(wrap=True, spacing=6, run_spacing=6)
+    manual_results_box = ft.ListView(spacing=6, height=360, padding=0)
+    MANUAL_RESULT_LIMIT = 60
+    manual_current_box = ft.Column(spacing=8)
+    manual_count_txt = ft.Text("0 exercises", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+
+    def manual_matches(e):
+        if manual_filt["muscles"] and e["muscle"] not in manual_filt["muscles"]:
+            return False
+        if manual_filt["equipment"] and not (set(eq_list(e)) & manual_filt["equipment"]):
+            return False
+        q = manual_filt["q"]
+        if q and q not in e["name"].lower():
+            return False
+        return True
+
+    def toggle_manual_pick(eid):
+        if eid in manual_picks:
+            manual_picks.remove(eid)
+        else:
+            manual_picks.append(eid)
+        render_manual_results()
+        render_manual_current()
+
+    def render_manual_results():
+        active_filter = bool(manual_filt["q"] or manual_filt["muscles"] or manual_filt["equipment"])
+        items = [e for e in EXERCISES if manual_matches(e)]
+        total = len(items)
+        truncated = (not active_filter) and total > MANUAL_RESULT_LIMIT
+        if truncated:
+            items = items[:MANUAL_RESULT_LIMIT]
+        rows = []
+        for e in items:
+            added = e["id"] in manual_picks
+            rows.append(ft.Container(
+                ft.Row([thumb(e),
+                        ft.Column([ft.Text(e["name"], size=13, weight=ft.FontWeight.W_500),
+                                   ft.Text(f"{e['muscle']} · {', '.join(eq_list(e))}", size=11,
+                                           color=ft.Colors.ON_SURFACE_VARIANT)],
+                                  spacing=0, expand=True),
+                        ft.IconButton(
+                            ft.Icons.CHECK_CIRCLE if added else ft.Icons.ADD_CIRCLE_OUTLINE,
+                            icon_color=ACCENT if added else ft.Colors.ON_SURFACE_VARIANT,
+                            on_click=lambda _, x=e["id"]: toggle_manual_pick(x))],
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=6, border_radius=8, bgcolor=CARD_BG))
+        if truncated:
+            rows.append(ft.Container(
+                ft.Text(f"Showing first {MANUAL_RESULT_LIMIT} of {total} — "
+                        "search by name or pick a muscle/equipment filter to narrow this down.",
+                        size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True),
+                padding=ft.Padding.symmetric(vertical=8)))
+        manual_results_box.controls = rows or [
+            ft.Text("No exercises match.", size=12, color=ft.Colors.ON_SURFACE_VARIANT)]
+        page.update()
+
+    def manual_current_row(e):
         return ft.Row([thumb(e),
                        ft.Column([ft.Text(e["name"], size=13, weight=ft.FontWeight.W_500),
                                   ft.Text(f"{e['muscle']} · {reps_for(e)}", size=11,
                                           color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True),
                        ft.IconButton(ft.Icons.CLOSE, icon_size=18,
-                                     on_click=lambda _, x=e["id"]: remove_manual_pick(x))],
+                                     on_click=lambda _, x=e["id"]: toggle_manual_pick(x))],
                       vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
-    def rebuild_manual_list():
+    def render_manual_current():
         items = [ex_by_id(i) for i in manual_picks]
         items = [e for e in items if e]
-        manual_list_box.controls = [manual_row(e) for e in items] or [
-            ft.Text("No exercises yet. Tap “+ Add exercises”.", size=12,
+        manual_current_box.controls = [manual_current_row(e) for e in items] or [
+            ft.Text("No exercises yet. Tap + on any exercise above.", size=12,
                     color=ft.Colors.ON_SURFACE_VARIANT)]
+        manual_count_txt.value = f"{len(items)} exercise{'' if len(items) == 1 else 's'}"
         page.update()
 
-    def remove_manual_pick(eid):
-        if eid in manual_picks:
-            manual_picks.remove(eid)
-        rebuild_manual_list()
+    def rebuild_manual_muscle_chips():
+        manual_muscle_chips_box.controls = [
+            chip(m, m in manual_filt["muscles"], lambda _, x=m: toggle_manual_muscle(x)) for m in MUSCLES]
+        page.update()
 
-    def apply_manual_picks(ids):
-        manual_picks[:] = ids
-        rebuild_manual_list()
+    def rebuild_manual_equip_chips():
+        manual_equip_chips_box.controls = [
+            chip(eq, eq in manual_filt["equipment"], lambda _, x=eq: toggle_manual_equipment(x))
+            for eq in EQUIPMENT]
+        n = len(manual_filt["equipment"])
+        manual_equip_count_txt.value = f"{n} selected" if n else "any"
+        page.update()
 
-    def open_manual_picker(_=None):
-        open_exercise_picker(manual_picks, apply_manual_picks, title="Add exercises")
+    manual_equip_open = {"v": False}
+    manual_equip_chevron = ft.Icon(ft.Icons.EXPAND_MORE, size=18, color=ft.Colors.ON_SURFACE_VARIANT)
+    manual_equip_count_txt = ft.Text("any", size=11, color=ft.Colors.ON_SURFACE_VARIANT)
+
+    def toggle_manual_equip_section(_=None):
+        manual_equip_open["v"] = not manual_equip_open["v"]
+        manual_equip_chips_container.visible = manual_equip_open["v"]
+        manual_equip_chevron.name = (ft.Icons.EXPAND_LESS if manual_equip_open["v"]
+                                     else ft.Icons.EXPAND_MORE)
+        page.update()
+
+    manual_equip_header = ft.Container(
+        ft.Row([ft.Text("Equipment", size=11, color=ft.Colors.ON_SURFACE_VARIANT, expand=True),
+               manual_equip_count_txt, manual_equip_chevron],
+              vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        on_click=toggle_manual_equip_section,
+        padding=ft.Padding.only(left=14, right=14, top=6))
+
+    manual_equip_chips_container = ft.Container(
+        manual_equip_chips_box, padding=ft.Padding.symmetric(horizontal=12), visible=False)
+
+    def toggle_manual_muscle(m):
+        if m in manual_filt["muscles"]:
+            manual_filt["muscles"].discard(m)
+        else:
+            manual_filt["muscles"].add(m)
+        rebuild_manual_muscle_chips()
+        render_manual_results()
+
+    def toggle_manual_equipment(eq):
+        if eq in manual_filt["equipment"]:
+            manual_filt["equipment"].discard(eq)
+        else:
+            manual_filt["equipment"].add(eq)
+        rebuild_manual_equip_chips()
+        render_manual_results()
+
+    def on_manual_search(ev):
+        manual_filt["q"] = (ev.control.value or "").strip().lower()
+        render_manual_results()
+
+    manual_search_field = ft.TextField(
+        hint_text="Search exercises…", dense=True, expand=True, height=44,
+        text_size=13, prefix_icon=ft.Icons.SEARCH,
+        content_padding=ft.Padding.symmetric(horizontal=10, vertical=10),
+        on_change=on_manual_search)
 
     def save_manual(_):
         items = [ex_by_id(i) for i in manual_picks]
@@ -869,17 +1025,50 @@ def main(page: ft.Page):
 
     def reset_manual(_=None):
         manual_picks.clear()
-        rebuild_manual_list()
+        manual_filt["q"] = ""
+        manual_filt["muscles"].clear()
+        manual_filt["equipment"].clear()
+        manual_search_field.value = ""
+        rebuild_manual_muscle_chips()
+        rebuild_manual_equip_chips()
+        render_manual_results()
+        render_manual_current()
+        page.update()
 
-    manual_section = ft.Column([
-        ft.Container(ft.Row([
-            ft.FilledButton("+ Add exercises", icon=ft.Icons.ADD, on_click=open_manual_picker, expand=True),
-            ft.IconButton(ft.Icons.RESTART_ALT, tooltip="Clear", on_click=reset_manual),
-        ]), padding=10),
-        ft.Container(manual_list_box, padding=ft.Padding.symmetric(horizontal=12)),
-        ft.Container(ft.FilledButton("Save workout", icon=ft.Icons.SAVE, on_click=save_manual, expand=True),
-                     padding=ft.Padding.only(left=10, right=10, top=10)),
-    ], expand=True, scroll=ft.ScrollMode.AUTO)
+    def pop_manual_view(_=None):
+        page.go("/")
+
+    def push_manual_view():
+        rebuild_manual_muscle_chips()
+        rebuild_manual_equip_chips()
+        render_manual_results()
+        render_manual_current()
+        page.go("/manual")
+
+    manual_view = ft.Column(
+        [ft.Container(ft.Row([ft.IconButton(ft.Icons.ARROW_BACK, on_click=pop_manual_view),
+                              ft.Text("Manual Builder", weight=ft.FontWeight.BOLD, size=18, expand=True),
+                              ft.IconButton(ft.Icons.RESTART_ALT, tooltip="Clear", on_click=reset_manual),
+                              ft.IconButton(ft.Icons.SAVE, tooltip="Save workout", on_click=save_manual)]),
+                      padding=ft.Padding.only(left=2, right=12, top=6)),
+         ft.Container(manual_search_field, padding=ft.Padding.symmetric(horizontal=14, vertical=6)),
+         ft.Container(ft.Text("Muscle Group", size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                      padding=ft.Padding.only(left=14)),
+         ft.Container(manual_muscle_chips_box, padding=ft.Padding.symmetric(horizontal=12)),
+         manual_equip_header,
+         manual_equip_chips_container,
+         ft.Divider(),
+         ft.Container(ft.Text("Add exercises", weight=ft.FontWeight.BOLD, size=13),
+                      padding=ft.Padding.only(left=14)),
+         ft.Container(manual_results_box, padding=ft.Padding.symmetric(horizontal=12)),
+         ft.Divider(),
+         ft.Container(ft.Row([ft.Text("Your workout", weight=ft.FontWeight.BOLD, size=13, expand=True),
+                              manual_count_txt]),
+                      padding=ft.Padding.only(left=14, right=14)),
+         ft.Container(manual_current_box, padding=ft.Padding.symmetric(horizontal=12)),
+         ft.Container(ft.FilledButton("Save Workout", icon=ft.Icons.SAVE, on_click=save_manual, expand=True),
+                      padding=ft.Padding.only(left=10, right=10, top=10, bottom=20))],
+        expand=True, scroll=ft.ScrollMode.AUTO)
 
     # ---------- AI generator: Google Gemini, constrained to our library ----------
     ai_results = ft.Column(spacing=12)
@@ -921,11 +1110,71 @@ def main(page: ft.Page):
             border=ft.Border.all(1, ft.Colors.with_opacity(0.5, ACCENT)))
 
     goal_field = ft.TextField(
-        label="What do you want to achieve?", multiline=True, min_lines=2, max_lines=4,
+        label="What do you want to achieve?", multiline=True, min_lines=4, max_lines=14,
+        expand=True,
         hint_text="e.g. 35-min upper-body pump, dumbbells + bands, hypertrophy")
     key_field = ft.TextField(label="Google Gemini API key", password=True, can_reveal_password=True)
     ai_status = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
     ai_build_btn = ft.FilledButton("Build workout with AI", icon=ft.Icons.AUTO_AWESOME)
+
+    # ---- on-device toggle (flet_aicore / Gemini Nano — Pixel only) ----
+    local_switch = ft.Switch(label="Run on-device (no key, Pixel only)", value=False)
+    local_note = ft.Text("", size=11, color=ft.Colors.ON_SURFACE_VARIANT)
+    local_download_btn = ft.TextButton("Download on-device model", visible=False)
+
+    def set_local_mode(_):
+        on = local_switch.value
+        key_field.visible = not on
+        local_download_btn.visible = on
+        if on:
+            page.run_task(_check_local_status)
+        page.update()
+
+    async def _check_local_status():
+        local_note.value = "Checking device support…"
+        page.update()
+        try:
+            status = await aicore.check_status()
+        except Exception as ex:
+            local_note.value = f"Unavailable: {ex}"
+            local_download_btn.visible = False
+            page.update()
+            return
+        if status == AiCoreStatus.AVAILABLE:
+            local_note.value = "Gemini Nano ready on this device."
+            local_download_btn.visible = False
+        elif status == AiCoreStatus.DOWNLOADABLE:
+            local_note.value = "Model not downloaded yet."
+            local_download_btn.visible = True
+        elif status == AiCoreStatus.DOWNLOADING:
+            local_note.value = "Model is downloading…"
+            local_download_btn.visible = False
+        else:
+            local_note.value = "This device doesn't support on-device AI (needs a Pixel with AICore)."
+            local_download_btn.visible = False
+        page.update()
+
+    async def _download_local(_):
+        local_download_btn.disabled = True
+        local_note.value = "Downloading… 0 MB"
+        page.update()
+
+        def _on_progress(b):
+            local_note.value = f"Downloading… {b / 1_000_000:.0f} MB"
+            page.update()
+
+        try:
+            await aicore.download(on_progress=_on_progress)
+        except Exception as ex:
+            local_note.value = f"Download failed: {ex}"
+            local_download_btn.disabled = False
+            page.update()
+            return
+        local_download_btn.disabled = False
+        await _check_local_status()
+
+    local_switch.on_change = set_local_mode
+    local_download_btn.on_click = lambda e: page.run_task(_download_local, e)
 
     async def _prefill_key():
         k = await page.shared_preferences.get("gemini_key")
@@ -935,22 +1184,44 @@ def main(page: ft.Page):
 
     async def _run_ai(_):
         goal = (goal_field.value or "").strip()
-        key = (key_field.value or "").strip()
-        if not goal or not key:
-            ai_status.value = "Enter a goal and your API key."
+        if not goal:
+            ai_status.value = "Enter a goal."
             page.update()
             return
-        await page.shared_preferences.set("gemini_key", key)
+
         ai_status.value = "Thinking… building your workout"
         ai_build_btn.disabled = True
         page.update()
-        try:
-            w = await asyncio.to_thread(ai_workout.generate, goal, EXERCISES, key)
-        except Exception as ex:
-            ai_status.value = f"Failed: {ex}"
-            ai_build_btn.disabled = False
-            page.update()
-            return
+
+        if local_switch.value:
+            try:
+                w = await ai_workout.generate_local(goal, EXERCISES, aicore)
+            except AiCoreUnavailableError:
+                ai_status.value = "On-device model isn't ready — check status above."
+                ai_build_btn.disabled = False
+                page.update()
+                return
+            except Exception as ex:
+                ai_status.value = f"Failed: {ex}"
+                ai_build_btn.disabled = False
+                page.update()
+                return
+        else:
+            key = (key_field.value or "").strip()
+            if not key:
+                ai_status.value = "Enter your API key."
+                ai_build_btn.disabled = False
+                page.update()
+                return
+            await page.shared_preferences.set("gemini_key", key)
+            try:
+                w = await asyncio.to_thread(ai_workout.generate, goal, EXERCISES, key)
+            except Exception as ex:
+                ai_status.value = f"Failed: {ex}"
+                ai_build_btn.disabled = False
+                page.update()
+                return
+
         ai_status.value = ""
         ai_build_btn.disabled = False
         ai_results.controls.insert(0, ai_result_card(w))
@@ -961,7 +1232,10 @@ def main(page: ft.Page):
 
     ai_section = ft.Column([
         ft.Container(ft.Column([
-            goal_field, key_field,
+            goal_field,
+            *([ft.Divider(), local_switch, local_note, local_download_btn]
+              if HAS_AICORE else []),
+            key_field,
             ft.Text("Free key: aistudio.google.com/apikey", size=10, color=ft.Colors.OUTLINE),
             ai_status, ai_build_btn], spacing=10), padding=10),
         ft.Divider(),
@@ -972,8 +1246,7 @@ def main(page: ft.Page):
 
     def set_gen_mode(ev):
         mode = ev.control.selected.copy().pop()
-        gen_body_area.content = {"auto": auto_section, "ai": ai_section,
-                                 "manual": manual_section}[mode]
+        gen_body_area.content = {"auto": auto_section, "ai": ai_section}[mode]
         page.update()
 
     def _seg_label(text):
@@ -981,11 +1254,10 @@ def main(page: ft.Page):
                             width=54, alignment=ft.Alignment.CENTER)
 
     gen_mode_switch = ft.SegmentedButton(
-        selected=["auto"], on_change=set_gen_mode, width=300,
+        selected=["auto"], on_change=set_gen_mode, width=200,
         show_selected_icon=False,
         segments=[ft.Segment(value="auto", label=_seg_label("Auto")),
-                  ft.Segment(value="ai", label=_seg_label("AI")),
-                  ft.Segment(value="manual", label=_seg_label("Manual"))])
+                  ft.Segment(value="ai", label=_seg_label("AI"))])
 
     generate_tab = ft.Column([
         ft.Container(gen_mode_switch, padding=ft.Padding.only(left=10, top=10)),
@@ -1020,7 +1292,7 @@ def main(page: ft.Page):
         if index == 0:
             show_hub(); body.content = exercises_tab
         elif index == 1:
-            body.content = workouts_view
+            body.content = workouts_tab
             page.run_task(refresh_workouts)
         else:
             rebuild_muscle_chips(); rebuild_spec_cards(); body.content = generate_tab
@@ -1053,6 +1325,12 @@ def main(page: ft.Page):
         page.views.append(ft.View(route="/", controls=[root_stack], padding=0, bgcolor=BG_APP))
         if page.route == "/list":
             page.views.append(ft.View(route="/list", controls=[ft.SafeArea(list_view, expand=True)],
+                                      padding=0, bgcolor=BG_APP))
+        elif page.route == "/manual":
+            page.views.append(ft.View(route="/manual", controls=[ft.SafeArea(manual_view, expand=True)],
+                                      padding=0, bgcolor=BG_APP))
+        elif page.route == "/saved":
+            page.views.append(ft.View(route="/saved", controls=[ft.SafeArea(saved_detail_view, expand=True)],
                                       padding=0, bgcolor=BG_APP))
         page.update()
 
