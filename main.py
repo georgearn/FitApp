@@ -1,20 +1,13 @@
 """
-FitApp (no-AI backup) — mini Freeletics-style workout app (Flet).
+FitApp — mini workout app (Flet).
 
-This is a stripped copy of fitapp/ with the Gemini "Generate with AI" feature
-removed entirely — no network calls, no API key, no ai_workout.py. Everything
-else (body map, search, exercise library, rule-based Generate) is identical.
+  1. Browse an exercise library by muscle group (body map or search), filter by equipment.
+  2. Each exercise: looping animation + step-by-step description.
+  3. GENERATE workout variations from your criteria (muscles / equipment / preset),
+     or with AI (on-device via flet_aicore, or Gemini via ai_workout.py), then save them.
 
-  1. Browse an exercise library, grouped by muscle group, filter by equipment.
-  2. Each exercise: 2-frame looping animation + step-by-step description.
-  3. GENERATE 2-3 workout variations from your criteria (target muscles /
-     available equipment / preset), then save the ones you like.
-
-Library: data/exercises.json, built by tools/build_library.py from the
-WorkoutX library staged in assets/img/ (workoutx_library.json +
-gifs_webp/<id>.webp). Animated WebPs bundled locally — works offline.
-List rows show a static thumbnail (tools/gen_thumbnails.py); the detail
-view plays the full animation.
+Library: data/exercises.json (built by tools/build_library.py); animated WebPs and
+thumbnails are bundled in assets/img/, so the app works offline.
 
 Run:    flet run main.py   |   flet run --web main.py
 Build:  flet build apk      (see README.md)
@@ -22,13 +15,12 @@ Build:  flet build apk      (see README.md)
 
 import asyncio
 import base64
-import os
 import random
 from datetime import datetime
 import flet as ft
 
 from data_store import (
-    BASE, EXERCISES, MUSCLES, EQUIPMENT, PRESETS, WORKOUTS_KEY,
+    EXERCISES, MUSCLES, EQUIPMENT, PRESETS,
     load_workouts, save_workouts, ex_by_id, eq_list, reps_for,
 )
 from generator import generate_variations
@@ -200,88 +192,6 @@ def main(page: ft.Page):
             padding=ft.Padding.symmetric(horizontal=10), border_radius=6,
             bgcolor=CARD_BG, border=ft.Border.all(1, CARD_BORDER),
             alignment=ft.Alignment.CENTER_LEFT)
-
-    # ---------- reusable multi-select exercise picker (search + muscle filter) ----------
-    def open_exercise_picker(current_ids, on_apply, title="Add exercises"):
-        picked = list(current_ids)
-        filt = {"q": "", "muscle": "All"}
-        list_col = ft.ListView(spacing=6, height=320)
-        count_txt = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
-
-        def toggle(eid, val):
-            if val and eid not in picked:
-                picked.append(eid)
-            elif not val and eid in picked:
-                picked.remove(eid)
-            count_txt.value = f"{len(picked)} selected"
-            page.update()
-
-        def matches(e):
-            if filt["muscle"] != "All" and e["muscle"] != filt["muscle"]:
-                return False
-            q = filt["q"]
-            if not q:
-                return True
-            hay = f"{e['name']} {e['muscle']}".lower()
-            return q in hay
-
-        def render():
-            items = [e for e in EXERCISES if matches(e)]
-            list_col.controls = [
-                ft.Container(
-                    ft.Row([thumb(e),
-                            ft.Column([ft.Text(e["name"], size=13, weight=ft.FontWeight.W_500),
-                                       ft.Text(f"{e['muscle']} · {', '.join(eq_list(e))}", size=11,
-                                               color=ft.Colors.ON_SURFACE_VARIANT)],
-                                      spacing=0, expand=True),
-                            ft.Checkbox(value=e["id"] in picked,
-                                       on_change=lambda ev, x=e["id"]: toggle(x, ev.control.value))],
-                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    padding=6, border_radius=8, bgcolor=CARD_BG)
-                for e in items
-            ] or [ft.Text("No exercises match.", size=12, color=ft.Colors.ON_SURFACE_VARIANT)]
-            count_txt.value = f"{len(picked)} selected"
-            page.update()
-
-        def on_search(ev):
-            filt["q"] = (ev.control.value or "").strip().lower()
-            render()
-
-        muscle_btn_txt = ft.Text("All", size=13)
-
-        def on_muscle(m):
-            filt["muscle"] = m
-            muscle_btn_txt.value = m
-            render()
-
-        def open_muscle_filter(_):
-            open_single_select(["All"] + MUSCLES, filt["muscle"], on_muscle, title="Muscle group")
-
-        search_field = ft.TextField(hint_text="Search exercises…", dense=True, expand=True, height=44,
-                                    text_size=13, content_padding=ft.Padding.symmetric(horizontal=10, vertical=10),
-                                    prefix_icon=ft.Icons.SEARCH, on_change=on_search)
-        muscle_pill = filter_pill(muscle_btn_txt, open_muscle_filter)
-
-        def cancel(_):
-            page.pop_dialog()
-
-        def confirm(_):
-            page.pop_dialog()
-            on_apply(picked)
-
-        render()
-        dlg = ft.AlertDialog(
-            title=ft.Text(title),
-            scrollable=True,
-            content=ft.Container(
-                ft.Column([ft.Row([search_field, muscle_pill],
-                                  vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                          count_txt, list_col],
-                          spacing=8, tight=True),
-                width=360, height=460),
-            actions=[ft.TextButton("Cancel", on_click=cancel),
-                     ft.FilledButton("Done", on_click=confirm)])
-        page.show_dialog(dlg)
 
     def variant_group_of(e):
         """Full sibling list (including e's own group) for any exercise that's
